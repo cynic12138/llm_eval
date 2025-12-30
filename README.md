@@ -160,9 +160,9 @@ python evaluate.py \
 ```bash
 python evaluate.py \
     --backend openai_compatible \
-    --api_base_url "http://10.10.0.102:7865/v1" \
-    --api_model_name "Fusion2-chat-v2.0" \
-    --api_key "sk-internal" \
+    --api_base_url "http://xxxxxx:8888/v1" \
+    --api_model_name "my_model" \
+    --api_key "111111(如果是本地部署模型，任意字符串即可)" \
     --dataset_path qa_data/swift_datasets_test.jsonl \
     --dataset_type qa \
     --dataset_name swift_qa \
@@ -395,4 +395,5 @@ A: 标准的分词工具（如NLTK的word_tokenize）是为英文设计的，对
 ## 贡献
 
 欢迎提交Issue和Pull Request！
+
 
