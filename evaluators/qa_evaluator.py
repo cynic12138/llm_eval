@@ -4,6 +4,7 @@ QA数据集评估器
 实现问答格式的评估指标
 """
 
+import os
 import re
 import unicodedata
 import numpy as np
@@ -13,9 +14,16 @@ import jieba
 from rouge_score import rouge_scorer
 from rouge_score import tokenizers
 from bert_score import score as bert_score
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import torch
 from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+
+# ModelScope支持
+try:
+    from modelscope import AutoTokenizer, AutoModelForMaskedLM
+    MODELSCOPE_AVAILABLE = True
+except ImportError:
+    MODELSCOPE_AVAILABLE = False
+
 
 # 初始化 jieba 分词器
 try:
@@ -76,44 +84,6 @@ class QAEvaluator:
         )
         # BLEU 平滑函数
         self.bleu_smoothing = SmoothingFunction().method1
-        
-        # 加载NLI模型用于矛盾检测
-        # 使用 hfl/rbtl3 模型（中文 RoBERTa-wwm-ext-large 3层模型）
-        # 注意：该模型是通用中文BERT模型，主要用于Fill-Mask任务，不是专门为NLI任务微调的
-        # 如果模型不支持序列分类，将回退到专门的NLI模型
-        try:
-            # 尝试加载 hfl/rbtl3 模型
-            self.nli_tokenizer = AutoTokenizer.from_pretrained('MoritzLaurer/mDeBERTa-v3-base-mnli-xnli')
-            self.nli_model = AutoModelForSequenceClassification.from_pretrained('MoritzLaurer/mDeBERTa-v3-base-mnli-xnli')
-            self.nli_model.eval()
-            # 标签顺序未知，需要根据实际测试确定
-            # 默认假设：0=蕴含, 1=中性, 2=矛盾（需要验证）
-            self.nli_label_order = 'entailment_neutral_contradiction'
-            print("已加载模型: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli")
-        except Exception as e1:
-            try:
-                # 回退到原来的中文NLI模型
-                self.nli_tokenizer = AutoTokenizer.from_pretrained('hfl/chinese-deberta-v3-base-nli')
-                self.nli_model = AutoModelForSequenceClassification.from_pretrained(
-                    'hfl/chinese-deberta-v3-base-nli'
-                )
-                self.nli_model.eval()
-                self.nli_label_order = 'entailment_neutral_contradiction'
-                print(f"错误详情: {e1}")
-            except Exception as e2:
-                try:
-                    # 最后回退到英文模型
-                    self.nli_tokenizer = AutoTokenizer.from_pretrained('microsoft/deberta-v3-base')
-                    self.nli_model = AutoModelForSequenceClassification.from_pretrained(
-                        'microsoft/deberta-v3-base'
-                    )
-                    self.nli_model.eval()
-                    self.nli_label_order = 'contradiction_neutral_entailment'
-                    print(f"警告: 无法加载中文模型，已回退到英文模型: {e2}")
-                except Exception as e3:
-                    print(f"警告: 无法加载NLI模型: {e3}")
-                    self.nli_model = None
-                    self.nli_label_order = None
     
     def normalize_text(self, text: str) -> str:
         """EM专用文本标准化（更宽松的精确匹配）
@@ -249,55 +219,29 @@ class QAEvaluator:
             }
     
     def bert_score(self, preds: List[str], refs: List[str]) -> float:
-        """BERTScore评估"""
+        """BERTScore评估（使用ModelScope加载模型）"""
         try:
             # 自动检测并使用CUDA（如果可用）
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             
+            # 使用ModelScope的模型标识符
+            if MODELSCOPE_AVAILABLE:
+                # 使用ModelScope的模型标识符，会自动从ModelScope下载
+                model_type = 'google-bert/bert-base-chinese'
+            else:
+                # 如果ModelScope不可用，回退到HuggingFace
+                model_type = 'bert-base-chinese'
+            
             P, R, F1 = bert_score(
                 preds, refs, 
                 lang='zh', 
-                model_type='bert-base-chinese',
+                model_type=model_type,
                 device=device,  # 指定设备以加速计算
                 verbose=False
             )
             return float(F1.mean().item())
         except Exception as e:
             print(f"警告: BERTScore计算失败: {e}")
-            return 0.0
-    
-    def nli_contradiction_detection(self, question: str, answer: str) -> float:
-        """NLI矛盾检测"""
-        if self.nli_model is None:
-            return 0.0
-        
-        try:
-            # 构建输入
-            inputs = self.nli_tokenizer(
-                question, answer,
-                return_tensors='pt',
-                truncation=True,
-                max_length=512
-            )
-            
-            with torch.no_grad():
-                outputs = self.nli_model(**inputs)
-                probs = torch.softmax(outputs.logits, dim=-1)
-                
-                # 根据模型类型确定标签顺序
-                if self.nli_label_order == 'entailment_neutral_contradiction':
-                    # 中文模型：0=蕴含, 1=中性, 2=矛盾
-                    contradiction_prob = probs[0][2].item()
-                elif self.nli_label_order == 'contradiction_neutral_entailment':
-                    # 英文模型（假设）：0=矛盾, 1=中性, 2=蕴含
-                    contradiction_prob = probs[0][0].item()
-                else:
-                    # 未知标签顺序，尝试使用索引2（通常矛盾在最后）
-                    contradiction_prob = probs[0][2].item()
-            
-            return contradiction_prob
-        except Exception as e:
-            print(f"警告: NLI检测失败: {e}")
             return 0.0
     
     def evaluate(self, data: List[Dict], dataset_name: str = "qa_dataset") -> List[Tuple[str, float, int]]:
@@ -427,16 +371,5 @@ class QAEvaluator:
         rouge_l_f1 = np.mean(rougeL_fmeasures)
         comprehensive_score = bert_score_value * 0.6 + rouge_l_f1 * 0.4
         results.append(('mean_Comprehensive_Score', comprehensive_score, len(data)))
-        
-        # 事实一致性 - NLI矛盾检测
-        print("计算事实一致性...")
-        contradiction_probs = []
-        for item, pred in tqdm(zip(data, predictions), total=len(data), desc="矛盾检测"):
-            contradiction_prob = self.nli_contradiction_detection(item['question'], pred)
-            contradiction_probs.append(contradiction_prob)
-        
-        avg_contradiction = np.mean(contradiction_probs)
-        consistency_score = 1.0 - avg_contradiction  # 一致性分数 = 1 - 矛盾概率
-        results.append(('mean_Factual_Consistency', consistency_score, len(data)))
         
         return results
