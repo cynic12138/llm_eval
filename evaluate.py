@@ -18,6 +18,7 @@ from evaluators.mcq_evaluator import MCQEvaluator
 from evaluators.benchmark_evaluator import BenchmarkEvaluator
 from evaluators.performance_evaluator import PerformanceEvaluator
 from evaluators.reliability_evaluator import ReliabilityEvaluator
+from evaluators.pretrain_evaluator import PretrainEvaluator
 from utils.model_loader import ModelLoader
 from utils.data_loader import DataLoader
 
@@ -171,6 +172,39 @@ class ModelEvaluator:
         
         return metrics
     
+    def evaluate_pretrain(self, pretrain_dataset_path: str, dataset_name: str = "pretrain_dataset",
+                          calculate_perplexity: bool = True, evaluate_generation: bool = True):
+        """
+        评估预训练模型
+        
+        Args:
+            pretrain_dataset_path: 预训练数据集路径
+            dataset_name: 数据集名称
+            calculate_perplexity: 是否计算困惑度
+            evaluate_generation: 是否评估生成质量
+        """
+        pretrain_evaluator = PretrainEvaluator(self.model_loader)
+        metrics = pretrain_evaluator.evaluate(
+            pretrain_dataset_path,
+            dataset_name,
+            calculate_perplexity=calculate_perplexity,
+            evaluate_generation=evaluate_generation,
+            max_samples=self.max_samples
+        )
+        
+        # 保存结果
+        for metric_name, score, num_samples in metrics:
+            self.results.append({
+                'model': self.model_id,
+                'dataset': dataset_name,
+                'dataset_type': 'PRETRAIN',
+                'metric': metric_name,
+                'num': num_samples,
+                'score': score
+            })
+        
+        return metrics
+    
     def generate_results_table(self) -> str:
         """生成结果表格"""
         if not self.results:
@@ -244,13 +278,22 @@ def main():
     parser.add_argument('--max_tokens', type=int, default=1024,
                         help='默认最大生成tokens DEFAULT_MAX_TOKENS')
     
-    # 自定义数据集参数
+    # 自定义数据集参数（支持多个数据集）
+    parser.add_argument('--qa_dataset', type=str, default=None,
+                       help='QA数据集路径（可选，如果提供则进行QA评测）')
+    parser.add_argument('--qa_dataset_name', type=str, default='qa_dataset',
+                       help='QA数据集名称（默认：qa_dataset）')
+    parser.add_argument('--mcq_dataset', type=str, default=None,
+                       help='MCQ数据集路径（可选，如果提供则进行MCQ评测）')
+    parser.add_argument('--mcq_dataset_name', type=str, default='mcq_dataset',
+                       help='MCQ数据集名称（默认：mcq_dataset）')
+    # 保留旧参数以兼容性（向后兼容）
     parser.add_argument('--dataset_path', type=str, default=None, 
-                       help='自定义数据集路径')
+                       help='[已弃用] 自定义数据集路径，建议使用 --qa_dataset 或 --mcq_dataset')
     parser.add_argument('--dataset_type', type=str, choices=['qa', 'mcq'], 
-                       default=None, help='数据集类型: qa 或 mcq')
+                       default=None, help='[已弃用] 数据集类型，建议使用 --qa_dataset 或 --mcq_dataset')
     parser.add_argument('--dataset_name', type=str, default='custom_dataset',
-                       help='数据集名称')
+                       help='[已弃用] 数据集名称，建议使用 --qa_dataset_name 或 --mcq_dataset_name')
     parser.add_argument('--max_samples', type=int, default=None,
                        help='自定义数据集评估时最多使用的样本数（默认使用全部样本）')
     
@@ -269,28 +312,58 @@ def main():
     parser.add_argument('--reliability_dataset', type=str, default=None,
                        help='可靠性测试数据集路径')
     
+    # 预训练模型评估参数
+    parser.add_argument('--pretrain_dataset', type=str, default=None,
+                       help='预训练数据集路径（用于评估LoRA微调后的模型）')
+    parser.add_argument('--pretrain_dataset_name', type=str, default='pretrain_dataset',
+                       help='预训练数据集名称（默认：pretrain_dataset）')
+    parser.add_argument('--no_perplexity', action='store_true',
+                       help='跳过困惑度计算（仅本地模型支持）')
+    parser.add_argument('--no_generation_quality', action='store_true',
+                       help='跳过生成质量评估')
+    
     # 输出参数
     parser.add_argument('--output', type=str, default='evaluation_results',
                        help='结果输出路径（不含扩展名）')
     
     # 设备参数（仅本地模型有效）
     parser.add_argument('--device', type=str, default='cuda',
-                       choices=['cuda', 'cpu'], help='设备类型（仅backend=local时生效）')
+                       help='设备类型（仅backend=local时生效）。支持：cuda（默认）或 cpu')
+    
+    # 多GPU参数（仅本地模型有效）
+    parser.add_argument('--device_map', type=str, default=None,
+                       help='模型并行策略（仅backend=local时生效）。'
+                            'auto: 自动将模型切分到多个GPU（推荐用于30B等大模型）。'
+                            '不指定或None: 单GPU模式（默认）')
+    parser.add_argument('--gpu_ids', type=str, default=None,
+                       help='指定使用的GPU ID（仅backend=local时生效）。'
+                            '格式如 "0,1,2,3" 或 "0-7"。'
+                            '当device_map=auto时，用于限制使用的GPU')
+    parser.add_argument('--max_memory', type=str, default=None,
+                       help='每个GPU的最大内存限制（仅backend=local时生效）。'
+                            '格式如 "0:20GiB,1:20GiB"。'
+                            '当device_map=auto时，用于控制内存分配')
     
     args = parser.parse_args()
     
     # 验证至少选择了一种评估方式
-    has_custom_dataset = args.dataset_path and args.dataset_type
+    has_qa_dataset = args.qa_dataset is not None
+    has_mcq_dataset = args.mcq_dataset is not None
+    # 向后兼容：支持旧的 --dataset_path 和 --dataset_type
+    has_old_dataset = args.dataset_path and args.dataset_type
     has_benchmarks = args.benchmarks is not None and len(args.benchmarks) > 0
     has_performance = args.evaluate_performance
     has_reliability = args.evaluate_reliability
+    has_pretrain = args.pretrain_dataset is not None
     
-    if not (has_custom_dataset or has_benchmarks or has_performance or has_reliability):
+    if not (has_qa_dataset or has_mcq_dataset or has_old_dataset or has_benchmarks or has_performance or has_reliability or has_pretrain):
         parser.error("请至少选择一种评估方式：\n"
-                    "  - 自定义数据集: --dataset_path 和 --dataset_type\n"
+                    "  - QA数据集: --qa_dataset\n"
+                    "  - MCQ数据集: --mcq_dataset\n"
                     "  - 基准数据集: --benchmarks\n"
                     "  - 性能指标: --evaluate_performance\n"
-                    "  - 可靠性指标: --evaluate_reliability")
+                    "  - 可靠性指标: --evaluate_reliability\n"
+                    "  - 预训练模型: --pretrain_dataset")
     
     # 验证模型来源参数
     if args.backend == 'local':
@@ -302,22 +375,42 @@ def main():
             if not args.api_base_url or not args.api_model_name:
                 parser.error("internal_api/openai_compatible 模式需要提供 --api_base_url 和 --api_model_name")
     
-    # 验证自定义数据集参数
-    if args.dataset_path and not args.dataset_type:
-        parser.error("使用 --dataset_path 时必须指定 --dataset_type (qa 或 mcq)")
-    if args.dataset_type and not args.dataset_path:
-        parser.error("使用 --dataset_type 时必须指定 --dataset_path")
+    # 验证数据集文件是否存在
+    if has_qa_dataset and not Path(args.qa_dataset).exists():
+        parser.error(f"QA数据集文件不存在: {args.qa_dataset}")
+    if has_mcq_dataset and not Path(args.mcq_dataset).exists():
+        parser.error(f"MCQ数据集文件不存在: {args.mcq_dataset}")
+    if has_old_dataset and not Path(args.dataset_path).exists():
+        parser.error(f"数据集文件不存在: {args.dataset_path}")
+    if has_pretrain and not Path(args.pretrain_dataset).exists():
+        parser.error(f"预训练数据集文件不存在: {args.pretrain_dataset}")
+    if has_pretrain and not Path(args.pretrain_dataset).exists():
+        parser.error(f"预训练数据集文件不存在: {args.pretrain_dataset}")
     
     # 验证可靠性数据集参数
     if args.evaluate_reliability and not args.reliability_dataset:
         print("警告: 进行可靠性评估但未提供可靠性数据集，将使用默认测试数据")
     
     try:
+        # 解析max_memory参数（如果提供）
+        max_memory_dict = None
+        if args.max_memory and args.backend == 'local':
+            try:
+                max_memory_dict = {}
+                for item in args.max_memory.split(','):
+                    gpu_id, memory = item.split(':')
+                    max_memory_dict[int(gpu_id.strip())] = memory.strip()
+            except Exception as e:
+                print(f"警告: 无法解析 --max_memory 参数 '{args.max_memory}'，将忽略: {e}")
+        
         # 创建模型加载器 / API 客户端
         model_loader = ModelLoader(
             backend=args.backend,
             model_path=args.model,
             device=args.device,
+            device_map=args.device_map if args.device_map != 'None' else None,
+            gpu_ids=args.gpu_ids,
+            max_memory=max_memory_dict,
             api_key=args.api_key,
             base_url=args.api_base_url,
             model_name=args.api_model_name,
@@ -329,9 +422,44 @@ def main():
         # 创建评估器
         evaluator = ModelEvaluator(model_loader, max_samples=args.max_samples)
         
-        # 评估自定义数据集
-        if has_custom_dataset:
+        # 评估QA数据集
+        if has_qa_dataset:
             try:
+                print(f"\n{'='*60}")
+                print(f"开始评估QA数据集: {args.qa_dataset_name}")
+                print(f"{'='*60}")
+                evaluator.evaluate_custom_dataset(
+                    args.qa_dataset, 
+                    'qa',
+                    args.qa_dataset_name
+                )
+            except Exception as e:
+                print(f"错误: QA数据集评估失败: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 评估MCQ数据集
+        if has_mcq_dataset:
+            try:
+                print(f"\n{'='*60}")
+                print(f"开始评估MCQ数据集: {args.mcq_dataset_name}")
+                print(f"{'='*60}")
+                evaluator.evaluate_custom_dataset(
+                    args.mcq_dataset, 
+                    'mcq',
+                    args.mcq_dataset_name
+                )
+            except Exception as e:
+                print(f"错误: MCQ数据集评估失败: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 向后兼容：评估旧格式的自定义数据集
+        if has_old_dataset:
+            try:
+                print(f"\n{'='*60}")
+                print(f"开始评估自定义数据集: {args.dataset_name} (类型: {args.dataset_type})")
+                print(f"{'='*60}")
                 evaluator.evaluate_custom_dataset(
                     args.dataset_path, 
                     args.dataset_type,
@@ -342,7 +470,7 @@ def main():
                 import traceback
                 traceback.print_exc()
         
-        # 评估基准数据集
+        # 评估基准数据集（CMMLU等）
         if has_benchmarks:
             try:
                 evaluator.evaluate_benchmarks(args.benchmarks)
@@ -366,6 +494,20 @@ def main():
                 evaluator.evaluate_reliability(args.reliability_dataset)
             except Exception as e:
                 print(f"错误: 可靠性指标评估失败: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # 评估预训练模型
+        if has_pretrain:
+            try:
+                evaluator.evaluate_pretrain(
+                    args.pretrain_dataset,
+                    args.pretrain_dataset_name,
+                    calculate_perplexity=not args.no_perplexity,
+                    evaluate_generation=not args.no_generation_quality
+                )
+            except Exception as e:
+                print(f"错误: 预训练模型评估失败: {e}")
                 import traceback
                 traceback.print_exc()
         
