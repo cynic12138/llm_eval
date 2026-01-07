@@ -153,6 +153,19 @@ class MCQEvaluator:
             correct_answer = item.get('answer', '').upper()
             options = item.get('options', {})
             
+            # 处理 options 可能是列表或字典的情况
+            if isinstance(options, list):
+                # 如果是列表，转换为字典
+                options_dict = {}
+                option_keys = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+                for idx, opt_value in enumerate(options):
+                    if idx < len(option_keys):
+                        options_dict[option_keys[idx]] = str(opt_value)
+                options = options_dict
+            elif not isinstance(options, dict):
+                # 如果既不是列表也不是字典，跳过该项
+                continue
+            
             if correct_answer in options:
                 correct_length = len(str(options[correct_answer]))
                 correct_lengths.append(correct_length)
@@ -232,6 +245,19 @@ class MCQEvaluator:
             question = item['question']
             options = item.get('options', {})
             
+            # 处理 options 可能是列表或字典的情况
+            if isinstance(options, list):
+                # 如果是列表，转换为字典（假设列表项是选项值，使用 A, B, C, D... 作为键）
+                options_dict = {}
+                option_keys = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
+                for idx, opt_value in enumerate(options):
+                    if idx < len(option_keys):
+                        options_dict[option_keys[idx]] = str(opt_value)
+                options = options_dict
+            elif not isinstance(options, dict):
+                # 如果既不是列表也不是字典，尝试转换为字典
+                options = {}
+            
             # 构建选项文本
             options_text = "\n".join([f"{k}. {v}" for k, v in options.items()])
             prompt = f"{question}\n{options_text}\n请选择正确答案（只需回答选项字母，如A、B、C或D）："
@@ -250,7 +276,7 @@ class MCQEvaluator:
                     # 如果提取失败，尝试从响应中查找选项字母
                     # 有时模型会返回完整答案文本，需要匹配选项内容
                     for opt_key, opt_value in options.items():
-                        if opt_value and opt_value.strip() in response:
+                        if opt_value and str(opt_value).strip() in response:
                             pred_option = opt_key.upper()
                             break
                 
